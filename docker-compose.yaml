@@ -4,8 +4,28 @@ services:
       context: ./app
       dockerfile: Dockerfile
     network_mode: "service:provider"
+    environment:
+      NOTIFY_PROVIDER_URL: ${NOTIFY_PROVIDER_URL:-http://127.0.0.1:3001}
+      NOTIFY_PROVIDER_API_KEY: ${NOTIFY_PROVIDER_API_KEY:-test-dev-2026}
+      NOTIFY_BACKLOG_CAPACITY: ${NOTIFY_BACKLOG_CAPACITY:-10000}
+      NOTIFY_WORKER_COUNT: ${NOTIFY_WORKER_COUNT:-4}
+      NOTIFY_MAX_ATTEMPTS: ${NOTIFY_MAX_ATTEMPTS:-5}
+      NOTIFY_LEASE_SECONDS: ${NOTIFY_LEASE_SECONDS:-30}
+      NOTIFY_ATTEMPT_TIMEOUT: ${NOTIFY_ATTEMPT_TIMEOUT:-5}
+      NOTIFY_RATE_LIMIT: ${NOTIFY_RATE_LIMIT:-50}
+      NOTIFY_RATE_WINDOW: ${NOTIFY_RATE_WINDOW:-10}
+      NOTIFY_RATE_SPACING: ${NOTIFY_RATE_SPACING:-0.2222222222222222}
+    volumes:
+      - notification-data:/data
     depends_on:
-      - provider
+      provider:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   provider:
     build:
@@ -28,6 +48,8 @@ services:
     environment:
       - TARGET_URL=http://provider:5000
     depends_on:
+      app:
+        condition: service_healthy
       provider:
         condition: service_healthy
       influxdb:
@@ -67,3 +89,6 @@ services:
     command: run /scripts/health-check.js
     depends_on:
       - provider
+
+volumes:
+  notification-data:
