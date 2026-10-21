@@ -43,3 +43,34 @@ El servicio de notificaciones está disponible en `localhost:3001`. Requiere el 
 4. **Resultados:** Visualiza el scorecard en tiempo real en [Grafana (localhost:3000)](http://localhost:3000/d/backend-performance-scorecard/)
 
 *Se valorará la robustez frente a errores inesperados, la calidad de la implementación y la arquitectura del pipeline de procesamiento.*
+
+## Implementation
+
+The application now persists requests and dispatch intent in SQLite and processes
+them with bounded asynchronous workers. It preserves the API and provider/k6
+contracts above. A named Docker volume retains data across container recreation.
+
+```sh
+docker compose up -d --build --wait app influxdb grafana
+docker compose run --rm load-test
+```
+
+The supplied provider can deliver only a few notifications per second. A load
+test may accept thousands of requests quickly; leave the application running
+until its durable backlog drains. HTTP checks alone do not prove delivery.
+
+- [Architecture, crash recovery and delivery guarantees](docs/architecture.md)
+- [Tests, load validation and eventual-delivery verification](docs/testing.md)
+- [Measured validation results](docs/validation.md)
+- [Final engineering audit](docs/audit.md)
+- [Environment configuration example](.env.example)
+
+For local development without Docker, use Python 3.12, install
+`app/requirements-dev.txt`, export `NOTIFY_PROVIDER_API_KEY=test-dev-2026`, and run
+`uvicorn main:app --app-dir app --host 0.0.0.0 --port 5000`. Other settings use the
+`NOTIFY_` prefix; see `app/notification_service/config.py`. The application fails
+startup when workers are enabled without provider credentials.
+
+Host port 5000 can conflict with macOS AirPlay. The testing guide documents a
+temporary host-port override that preserves internal port 5000 and the original
+load tests. No commits or pushes are required to run the implementation.
