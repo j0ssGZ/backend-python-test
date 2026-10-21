@@ -1,10 +1,15 @@
 # Final engineering audit
 
+This is the audit snapshot preceding the documentation/release pass. See
+[release validation](validation.md#release-validation-after-audit-fixes) for the
+subsequent original k6 rerun against the corrected application source.
+
 ## Scope and result
 
 Reviewed the entire implementation diff, untracked source/tests/documentation,
 local generated evidence, original API contracts, provider behavior and original
-k6 assertions. Work remains on the personal fork's `main`; no push was performed.
+k6 assertions. The audit was performed on the personal fork's `main`; it did not
+push changes.
 The five provider/k6 files match baseline `8c5c7f5` byte for byte.
 
 No critical defect was identified in the challenge's intended local deployment.
@@ -95,7 +100,7 @@ all scheduling races or external side-effect duplication.
 - The verifier examines records present since a timestamp. Compare its total
   against accepted creations from k6; otherwise missing records cannot be
   detected by enumerating the database alone. The historical run matched 2,706.
-- The original provider check retains its documented 19/20 result: its expected
+- The original provider check retains its historical 19/20 result: its expected
   error field differs from the provider's simulated 500 response. Neither source
   was modified. The original load test has no failure thresholds.
 
@@ -115,8 +120,10 @@ all scheduling races or external side-effect duplication.
   untracked files from masking a broken intermediate commit.
 - The official k6 run and full 2,706-record delivery verification in
   [validation.md](validation.md) predate these two cancellation fixes. They were
-  reviewed, not rerun during this final audit. Final-source validation consists of
-  the regression suite, Linux tests, image rebuild and real-provider smoke test.
+  reviewed, not rerun during this final audit. Validation at audit completion
+  consisted of the regression suite, Linux tests, image rebuild and real-provider
+  smoke test.
+  The later release pass adds a separately recorded full k6/delivery run.
 
 Generated JSON, coverage output, caches and local databases are excluded from
 Git. The implementation, tests, deployment configuration and documentation are
