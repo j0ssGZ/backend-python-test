@@ -2,25 +2,33 @@
 
 ## Scope and contracts
 
-The service runs on Python 3.12 and exposes the original API on port 5000:
-
-- `POST /v1/requests` accepts `to`, `message`, and `type` (`email`, `sms`, `push`),
-  and returns `201 {"id": "<UUID>"}` after the SQLite commit.
-- `POST /v1/requests/{id}/process` durably enables processing and returns 202.
-  Repeating it is safe; terminal requests return 200 without being resent.
-- `GET /v1/requests/{id}` returns `200 {"id": "...", "status": "..."}`.
-- Unknown identifiers return 404. Invalid request bodies return 422. Full backlog
-  or temporarily unavailable storage returns 503; capacity rejection includes
-  `Retry-After`.
-- `GET /health/ready` checks storage and worker task availability. It indicates
-  acceptance readiness, not immediate provider availability or an empty backlog.
+The service runs on Python 3.12 and preserves the [HTTP contracts](../readme.md#http-api)
+on port 5000. Successful creation and activation responses follow the SQLite
+commit. Readiness indicates storage and worker task availability, not immediate
+provider availability or an empty backlog.
 
 Creation does not send. `process_requested_at` records the separate dispatch
 intent; this is necessary because both registered and dispatchable jobs can be
 publicly `queued`. Identical creation payloads intentionally produce different
 IDs. Optional creation idempotency is deferred.
 
-## Boundaries
+## Components and boundaries
+
+```mermaid
+flowchart LR
+    Client[Client or original k6] --> API[FastAPI routes and Pydantic schemas]
+    subgraph App[One application process]
+        API --> Service[Application use cases]
+        Service --> Repo[SQLite repository]
+        Workers[Four async workers] --> Repo
+        Workers --> Limiter[Global rate limiter]
+        Limiter --> Repo
+        Workers --> HTTP[Provider adapter and shared HTTPX client]
+    end
+    Repo --> DB[(SQLite WAL on named volume)]
+    HTTP --> Provider[Supplied external provider]
+```
+
 
 The architecture uses modules rather than a large hierarchy of packages:
 
@@ -41,7 +49,61 @@ through aiosqlite; a connection-local lock prevents interleaved transactions.
 `BEGIN IMMEDIATE` provides atomicity across additional connections/processes.
 No database transaction spans an HTTP call or a quota/backoff wait.
 
-## State and crash recovery
+## Request lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Registered: POST creation commits
+    state "queued: not activated" as Registered
+    state "queued: processing requested" as Ready
+    state "processing: active lease" as Active
+    state "processing: scheduled retry" as Retry
+    state "sent" as Sent
+    state "failed" as Failed
+    Registered --> Ready: POST process commits intent
+    Ready --> Ready: Repeated process
+    Ready --> Active: Quota admitted and atomic claim
+    Active --> Sent: Validated success and fenced commit
+    Active --> Retry: Retryable failure with attempts remaining
+    Retry --> Active: Retry due, quota admitted, atomic claim
+    Active --> Active: Expired lease reclaimed with new token
+    Active --> Failed: Permanent failure or attempts exhausted
+    Sent --> [*]
+    Failed --> [*]
+```
+
+`Registered` and `Ready` are explanatory substates, not additional stored status
+values. Repeated process calls do not reset retry schedules or reopen terminal
+states. The self-transition on `Active` requires the old lease to have expired.
+
+## Worker recovery
+
+```mermaid
+sequenceDiagram
+    participant Old as Old worker
+    participant DB as SQLite
+    participant P as Provider
+    participant New as Restarted worker
+    Old->>DB: Atomic claim, attempts + 1, token A, expiry
+    Old->>P: Send with total attempt deadline
+    Note over Old,P: Crash may occur before or after external delivery
+    New->>DB: Persist startup cooldown (15 seconds by default)
+    Note over New,DB: Wait for due work, quota and lease expiration
+    New->>DB: BEGIN IMMEDIATE: reclaim expired job
+    alt Attempts remain
+        DB-->>New: New token B and expiry, attempts + 1
+        New->>P: Retry (external duplication is possible)
+        P-->>New: Validated delivery confirmation
+        New->>DB: Mark sent only while token B is valid
+    else Final attempt was abandoned
+        New->>DB: Mark expired exhausted job failed
+    end
+    opt Old worker resumes late
+        Old->>DB: Attempt completion with token A
+        DB-->>Old: Reject expired or replaced ownership
+    end
+```
+
 
 The public lifecycle is `queued -> processing -> sent|failed`. A transient failure
 remains `processing` with a durable `next_attempt_at`, but no live lease. Terminal
@@ -114,11 +176,40 @@ the configured provider window. Retry schedules are persisted, not sleeping jobs
 The shared client additionally has connect/write/pool timeouts of one second and
 a read timeout of two seconds, within the five-second total attempt deadline.
 
+### Retry decisions
+
+```mermaid
+flowchart TD
+    Due[Activated job is due] --> Quota[Wait for durable global quota]
+    Quota --> Stop{Shutdown requested?}
+    Stop -->|Yes| Exit[Leave job unclaimed]
+    Stop -->|No| Claim[Atomic claim with lease and attempt increment]
+    Claim --> Call[HTTPX call with total deadline]
+    Call --> Outcome{Outcome}
+    Outcome -->|Validated 200| Sent[Fenced commit: sent]
+    Outcome -->|Permanent error or invalid success| Failed[Fenced commit: failed]
+    Outcome -->|429| Cooldown[Persist shared cooldown]
+    Outcome -->|5xx or transport error or timeout| Budget{Attempts remain?}
+    Cooldown --> Budget
+    Budget -->|No| Failed
+    Budget -->|Yes| Schedule[Persist jittered backoff and Retry-After minimum]
+    Schedule --> Retry[Keep processing status and clear lease]
+    Retry --> Due
+```
+
+The claim can also find no available job after another worker wins. All completion
+writes require a current token and unexpired lease; a failed fenced write does not
+change status. Unexpected exceptions/cancellation leave the lease for recovery.
+
 ## Persistence, capacity and deployment
 
 SQLite uses WAL, `synchronous=FULL`, short transactions and a one-second busy
 timeout. Local durable storage is adequate for this one-instance challenge;
 fsync cost and SQLite's single-writer throughput remain measurable constraints.
+A separate broker would add deployment and acknowledgement/transaction complexity
+without increasing the supplied provider's throughput. Internal workers keep the
+challenge small, but share the API process's failure and resource boundaries; the
+durable table, rather than task memory, is what makes restarts recoverable.
 The named `/data` volume survives container replacement. Removing that volume
 deletes notifications. WAL is intended for local storage, not shared NFS.
 

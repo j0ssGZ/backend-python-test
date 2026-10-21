@@ -1,76 +1,79 @@
-﻿# Python Backend Challenge: Notification Service
+# Notification API — AMS Solutions / Inditex challenge
 
-## El Reto
-Implementar un servicio de notificaciones que actúe como mediador entre los clientes y un proveedor externo. Tu objetivo es diseñar una solución sólida que pase la suite de validación de rendimiento y resiliencia.
+A durable notification API that accepts email, SMS and push requests, then sends
+activated requests through the supplied unreliable provider. The implementation
+preserves the challenge's HTTP contracts and Docker network layout. The original
+provider and k6 tests are unchanged.
 
-```mermaid 
-flowchart LR
-    A[Client] --> B(Your App)
-    B --> C[Notification Provider]
-    
-    style B fill:#1a2a6c,stroke:#fff,stroke-width:2px,color:#fff
-```
+**Stack:** Python 3.12, FastAPI, Pydantic v2, async HTTPX, SQLite/aiosqlite,
+pytest and Docker Compose. Small domain, application and infrastructure modules
+provide pragmatic hexagonal boundaries without a separate broker.
 
-## Contrato de API
-Para que la suite de tests (k6) pueda validar tu solución, debes implementar estrictamente los siguientes endpoints en el **puerto 5000**:
+## Guarantees and scope
 
-- **Registro de Solicitud:** `POST /v1/requests`  
-  Cuerpo (JSON): `{"to": "string", "message": "string", "type": "email|sms|push"}`  
-  Respuesta: `201 Created` con JSON `{"id": "string"}`.
+- Creation and processing intent are committed before successful API responses.
+- Four bounded async workers share one HTTP client. Durable rate reservations
+  enforce 50 attempts per sliding 10 seconds, with conservative startup cooldown.
+- Retries use persisted schedules, exponential backoff and jitter. Expiring leases
+  allow recovery after crashes and prevent stale workers from overwriting results.
+- Repeating `/process` is safe. Creation alone does not send; identical creations
+  intentionally receive different IDs.
+- `sent` requires a validated provider confirmation. **Exactly-once delivery is
+  impossible** without provider idempotency or delivery lookup; ambiguous failures
+  can duplicate sends. Five attempts do not guarantee every notification succeeds.
 
-- **Procesamiento de Envío:** `POST /v1/requests/{id}/process`  
-  Descripción: Lanza la integración con el proveedor externo.  
-  Respuesta: `200 OK` o `202 Accepted`.
+This is a single-host technical challenge deployment. Public exposure requires
+security hardening; see the [audit and outstanding risks](docs/audit.md).
 
-- **Consulta de Estado:** `GET /v1/requests/{id}`  
-  Respuesta: `200 OK` con JSON `{"id": "string", "status": "queued|processing|sent|failed"}`.
+## Quick start
 
----
+Requirements: Docker with Compose v2, available host ports 3000/3001/5000, and a
+POSIX shell for the examples. Run commands from the repository root. Python 3.12
+and `uv` are needed only for local development/tests; the delivery verifier uses
+Python 3's standard library.
 
-## Integración con el Provider
-El servicio de notificaciones está disponible en `localhost:3001`. Requiere el encabezado de seguridad: `X-API-Key: test-dev-2026`.
-
-- **Notificaciones:** `/v1/notify` (Esquema definido en los docs del provider).
-- **Documentación:** Puedes consultar los Swagger Docs en `http://localhost:3001/docs`.
-
----
-
-## Ejecución y Evaluación
-
-1. **Levantar infraestructura:** `docker-compose up -d provider influxdb grafana`
-2. **Tu aplicación:** `docker-compose up -d --build app`
-3. **Validación (k6):** `docker-compose run --rm load-test`
-4. **Resultados:** Visualiza el scorecard en tiempo real en [Grafana (localhost:3000)](http://localhost:3000/d/backend-performance-scorecard/)
-
-*Se valorará la robustez frente a errores inesperados, la calidad de la implementación y la arquitectura del pipeline de procesamiento.*
-
-## Implementation
-
-The application now persists requests and dispatch intent in SQLite and processes
-them with bounded asynchronous workers. It preserves the API and provider/k6
-contracts above. A named Docker volume retains data across container recreation.
+If macOS AirPlay occupies port 5000, first apply the
+[documented host-port override](docs/testing.md#host-port-override).
 
 ```sh
 docker compose up -d --build --wait app influxdb grafana
-docker compose run --rm load-test
+curl --fail "${NOTIFY_TEST_BASE_URL:-http://127.0.0.1:5000}/health/ready"
 ```
 
-The supplied provider can deliver only a few notifications per second. A load
-test may accept thousands of requests quickly; leave the application running
-until its durable backlog drains. HTTP checks alone do not prove delivery.
+Compose supplies the provider's public development credential. Optional settings
+are listed in [.env.example](.env.example); create a local `.env` if overriding
+Compose defaults. Application data lives in the named `notification-data` volume
+and survives app container recreation. Removing the volume deletes that data.
 
-- [Architecture, crash recovery and delivery guarantees](docs/architecture.md)
-- [Tests, load validation and eventual-delivery verification](docs/testing.md)
-- [Measured validation results](docs/validation.md)
-- [Final engineering audit](docs/audit.md)
-- [Environment configuration example](.env.example)
+Default endpoints: [API docs](http://localhost:5000/docs),
+[provider docs](http://localhost:3001/docs), and
+[Grafana scorecard](http://localhost:3000/d/backend-performance-scorecard/).
+With the override, API docs move to `http://localhost:15000/docs`.
 
-For local development without Docker, use Python 3.12, install
-`app/requirements-dev.txt`, export `NOTIFY_PROVIDER_API_KEY=test-dev-2026`, and run
-`uvicorn main:app --app-dir app --host 0.0.0.0 --port 5000`. Other settings use the
-`NOTIFY_` prefix; see `app/notification_service/config.py`. The application fails
-startup when workers are enabled without provider credentials.
+## HTTP API
 
-Host port 5000 can conflict with macOS AirPlay. The testing guide documents a
-temporary host-port override that preserves internal port 5000 and the original
-load tests. No commits or pushes are required to run the implementation.
+- `POST /v1/requests` — JSON `{"to":"recipient","message":"Hello","type":"email"}`;
+  returns **201** with `{"id":"<UUID>"}`. Types: `email`, `sms`, `push`.
+- `POST /v1/requests/{id}/process` — enables delivery; returns **202**, or **200**
+  for an already terminal request, with `{"id":"<UUID>","status":"..."}`.
+- `GET /v1/requests/{id}` — returns **200** with ID and
+  `queued`, `processing`, `sent` or `failed` status.
+- `GET /health/ready` — checks storage and worker liveness; **200** when ready.
+
+Unknown IDs return 404, invalid bodies 422, and backlog/storage unavailability
+503. Readiness and a 202 response do not mean delivery is complete. Both newly
+registered and activated requests waiting for a worker can be `queued`.
+
+## Review and validation
+
+Start with [architecture and Mermaid diagrams](docs/architecture.md), then use
+[testing instructions](docs/testing.md) for local tests, Docker validation, the
+original k6 scenario and verification of every accepted request after draining.
+The [measured results](docs/validation.md) record benchmark runs separately from
+unit-test results. The [audit](docs/audit.md) records corrected defects and
+remaining limitations.
+
+The provider allows only a few attempts per second. The 40-second k6 scenario
+can enqueue thousands of notifications; keep the service running for minutes
+until the backlog drains. Passing HTTP checks alone does not establish delivery.
+The separate provider-check discrepancy is documented rather than hidden.
